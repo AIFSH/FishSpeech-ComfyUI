@@ -39,10 +39,8 @@ class FishSpeechNode:
         return {
             "required":{
                 "text":("TEXT",),
-                "prompt_text":("TEXT",),
-                "prompt_audio":("AUDIO",),
                 "num_samples":("INT",{
-                    "default":1
+                    "default":2
                 }),
                 "max_new_tokens":("INT",{
                     "default":0
@@ -66,6 +64,10 @@ class FishSpeechNode:
                 "seed":("INT",{
                     "default":42
                 })
+            },
+            "optional":{
+                "prompt_text":("TEXT",),
+                "prompt_audio":("AUDIO",),
             }
         }
     
@@ -78,33 +80,38 @@ class FishSpeechNode:
 
     CATEGORY = "AIFSH_FishSpeech"
 
-    def gen_audio(self,text,prompt_text,prompt_audio,num_samples,
-                  max_new_tokens,top_p,repetition_penalty,temperature,
-                  chunk_length,seed):
-        ## 1. 从语音生成 prompt
-        speech = prompt_audio["waveform"].squeeze(0)
-        if speech.shape[0] > 1:
-            speech = speech.mean(dim=0,keepdim=True)
-        source_sr = prompt_audio["sample_rate"]
-        print(speech.shape)
-        print(source_sr)
+    def gen_audio(self,text,num_samples,max_new_tokens,top_p,repetition_penalty,temperature,
+                  chunk_length,seed,prompt_text=None,prompt_audio=None):
+        device = "cuda"
         if self.vqgan_model is None:
             self.vqgan_model = load_vqgan_model(config_name="firefly_gan_vq",
                                     checkpoint_path=os.path.join(ckpt_dir,"firefly-gan-vq-fsq-8x1024-21hz-generator.pth"))
-        
         prompt_sr = self.vqgan_model.spec_transform.sample_rate
-        if source_sr != prompt_sr:
-            speech = torchaudio.transforms.Resample(orig_freq=source_sr, new_freq=prompt_sr)(speech)
-        device = "cuda"
-        audios = speech[None].to(device)
-        print(audios.shape)
-        print(f"Loaded audio with {audios.shape[2] / prompt_sr:.2f} seconds")
-        
-        # VQ Encoder
-        audio_lengths = torch.tensor([audios.shape[2]], device=device, dtype=torch.long)
-        indices = self.vqgan_model.encode(audios, audio_lengths)[0][0]
+        ## 1. 从语音生成 prompt
+        if prompt_audio is not None:
+            speech = prompt_audio["waveform"].squeeze(0)
+            if speech.shape[0] > 1:
+                speech = speech.mean(dim=0,keepdim=True)
+            source_sr = prompt_audio["sample_rate"]
+            print(speech.shape)
+            print(source_sr)
+            if source_sr != prompt_sr:
+                speech = torchaudio.transforms.Resample(orig_freq=source_sr, new_freq=prompt_sr)(speech)
+            
+            audios = speech[None].to(device)
+            print(audios.shape)
+            print(f"Loaded audio with {audios.shape[2] / prompt_sr:.2f} seconds")
+            
+            # VQ Encoder
+            audio_lengths = torch.tensor([audios.shape[2]], device=device, dtype=torch.long)
+            indices = self.vqgan_model.encode(audios, audio_lengths)[0][0]
 
-        print(f"Generated indices of shape {indices.shape}")
+            print(f"Generated indices of shape {indices.shape}")
+            prompt_tokens = [indices]
+            prompt_text = [prompt_text]
+        else:
+            prompt_tokens = None
+            prompt_text = None
 
         # 2.从文本生成语义 token
         precision = torch.half
@@ -117,7 +124,7 @@ class FishSpeechNode:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             print(f"Time to load model: {time.time() - t0:.02f} seconds")
-        prompt_tokens = [indices]
+        # prompt_tokens = [indices]
 
         torch.manual_seed(seed)
 
@@ -134,10 +141,10 @@ class FishSpeechNode:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
-            compile=False,
+            compile=True,
             iterative_prompt=True,
             chunk_length=chunk_length,
-            prompt_text=[prompt_text],
+            prompt_text=prompt_text,
             prompt_tokens=prompt_tokens,
         )
 
@@ -153,6 +160,7 @@ class FishSpeechNode:
                     new_indices = torch.cat(codes, dim=1)
                     # np.save(f"codes_{idx}.npy", torch.cat(codes, dim=1).cpu().numpy())
                     # logger.info(f"Saved codes to codes_{idx}.npy")
+                    break
                 print(f"Next sample")
                 codes = []
                 idx += 1
@@ -160,7 +168,6 @@ class FishSpeechNode:
                 print(f"Error: {response}")
         
         # 3. 从语义 token 生成人声
-        
         feature_lengths = torch.tensor([new_indices.shape[1]], device=device)
         fake_audios, _ = self.vqgan_model.decode(
             indices=new_indices[None], feature_lengths=feature_lengths
@@ -168,9 +175,10 @@ class FishSpeechNode:
         audio_time = fake_audios.shape[-1] / self.vqgan_model.spec_transform.sample_rate
 
         print(
-            f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.2f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
+            f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.2f} seconds from {new_indices.shape[1]} features, features/second: {new_indices.shape[1] / audio_time:.2f}"
         )
-
+        self.vqgan_model = None
+        self.llama_model = None
         # Save audio
         res = {
             "waveform": fake_audios,
